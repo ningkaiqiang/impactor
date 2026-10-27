@@ -31,6 +31,8 @@ pub enum AnisetteError {
     InvalidArgument(String),
     #[error("Anisette not provisioned!")]
     AnisetteNotProvisioned,
+    #[error("Invalid remote Anisette response: {0}")]
+    InvalidRemoteResponse(String),
     #[error("Plist serialization error {0}")]
     PlistError(#[from] plist::Error),
     #[error("Request Error {0}")]

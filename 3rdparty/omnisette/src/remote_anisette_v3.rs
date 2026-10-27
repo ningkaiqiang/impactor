@@ -76,6 +76,37 @@ fn base64_decode(data: &str) -> Vec<u8> {
     general_purpose::STANDARD.decode(data.trim()).unwrap()
 }
 
+fn protocol_dictionary<'a>(
+    value: &'a plist::Value,
+    key: &str,
+    stage: &str,
+) -> Result<&'a Dictionary, AnisetteError> {
+    value
+        .as_dictionary()
+        .and_then(|dictionary| dictionary.get(key))
+        .and_then(plist::Value::as_dictionary)
+        .ok_or_else(|| {
+            AnisetteError::InvalidRemoteResponse(format!(
+                "{stage} response is missing the {key} dictionary"
+            ))
+        })
+}
+
+fn protocol_string<'a>(
+    dictionary: &'a Dictionary,
+    key: &str,
+    stage: &str,
+) -> Result<&'a str, AnisetteError> {
+    dictionary
+        .get(key)
+        .and_then(plist::Value::as_string)
+        .ok_or_else(|| {
+            AnisetteError::InvalidRemoteResponse(format!(
+                "{stage} response is missing the {key} string"
+            ))
+        })
+}
+
 #[derive(Deserialize)]
 struct AnisetteClientInfo {
     client_info: String,
@@ -263,7 +294,7 @@ impl AnisetteClient {
                 if message.contains("-45061") {
                     Err(AnisetteError::AnisetteNotProvisioned)
                 } else {
-                    panic!("Unknown error {}", message)
+                    Err(AnisetteError::InvalidRemoteResponse(message))
                 }
             }
             AnisetteHeaders::Headers {
@@ -295,24 +326,10 @@ impl AnisetteClient {
         let text = resp.text().await?;
 
         let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-        let urls = protocol_val
-            .as_dictionary()
-            .unwrap()
-            .get("urls")
-            .unwrap()
-            .as_dictionary()
-            .unwrap();
+        let urls = protocol_dictionary(&protocol_val, "urls", "lookup")?;
 
-        let start_provisioning_url = urls
-            .get("midStartProvisioning")
-            .unwrap()
-            .as_string()
-            .unwrap();
-        let end_provisioning_url = urls
-            .get("midFinishProvisioning")
-            .unwrap()
-            .as_string()
-            .unwrap();
+        let start_provisioning_url = protocol_string(urls, "midStartProvisioning", "lookup")?;
+        let end_provisioning_url = protocol_string(urls, "midFinishProvisioning", "lookup")?;
         debug!(
             "Got provisioning urls: {} and {}",
             start_provisioning_url, end_provisioning_url
@@ -338,11 +355,13 @@ impl AnisetteClient {
         }
 
         loop {
-            let Some(Ok(data)) = connection.next().await else {
-                continue;
+            let data = match connection.next().await {
+                Some(Ok(data)) => data,
+                Some(Err(err)) => return Err(err.into()),
+                None => break,
             };
             if data.is_text() {
-                let txt = data.to_text().unwrap();
+                let txt = data.to_text()?;
                 let msg: ProvisionInput = serde_json::from_str(txt)?;
                 match msg {
                     ProvisionInput::GiveIdentifier => {
@@ -375,17 +394,9 @@ impl AnisetteClient {
                         let text = resp.text().await?;
 
                         let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-                        let spim = protocol_val
-                            .as_dictionary()
-                            .unwrap()
-                            .get("Response")
-                            .unwrap()
-                            .as_dictionary()
-                            .unwrap()
-                            .get("spim")
-                            .unwrap()
-                            .as_string()
-                            .unwrap();
+                        let response =
+                            protocol_dictionary(&protocol_val, "Response", "start provisioning")?;
+                        let spim = protocol_string(response, "spim", "start provisioning")?;
 
                         debug!("GiveStartProvisioningData");
                         #[derive(Serialize)]
@@ -417,13 +428,8 @@ impl AnisetteClient {
                         let text = resp.text().await?;
 
                         let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-                        let response = protocol_val
-                            .as_dictionary()
-                            .unwrap()
-                            .get("Response")
-                            .unwrap()
-                            .as_dictionary()
-                            .unwrap();
+                        let response =
+                            protocol_dictionary(&protocol_val, "Response", "finish provisioning")?;
 
                         debug!("GiveEndProvisioningData");
 
@@ -433,8 +439,8 @@ impl AnisetteClient {
                             tk: &'t str,
                         }
                         let end_provisioning = EndProvisioning {
-                            ptm: response.get("ptm").unwrap().as_string().unwrap(),
-                            tk: response.get("tk").unwrap().as_string().unwrap(),
+                            ptm: protocol_string(response, "ptm", "finish provisioning")?,
+                            tk: protocol_string(response, "tk", "finish provisioning")?,
                         };
                         connection
                             .send(Message::Text(
@@ -454,7 +460,13 @@ impl AnisetteClient {
             }
         }
 
-        Ok(())
+        if state.is_provisioned() {
+            Ok(())
+        } else {
+            Err(AnisetteError::InvalidRemoteResponse(
+                "provisioning session ended before completing".to_string(),
+            ))
+        }
     }
 }
 
@@ -518,7 +530,7 @@ impl AnisetteHeadersProvider for RemoteAnisetteProviderV3 {
                     plist::to_file_xml(config_path, state)?;
                     client.get_headers(&state).await?
                 } else {
-                    panic!()
+                    return Err(err);
                 }
             }
         };
